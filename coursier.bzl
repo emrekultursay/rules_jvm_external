@@ -16,7 +16,7 @@ load("//private/rules:jetifier.bzl", "jetify_artifact_dependencies", "jetify_mav
 load("//:specs.bzl", "maven", "parse", "utils")
 load("//:private/proxy.bzl", "get_java_proxy_args")
 load("//:private/dependency_tree_parser.bzl", "JETIFY_INCLUDE_LIST_JETIFY_ALL", "parser")
-load("//:private/coursier_utilities.bzl", "SUPPORTED_PACKAGING_TYPES", "escape")
+load("//:private/coursier_utilities.bzl", "SUPPORTED_PACKAGING_TYPES", "escape", "is_maven_local_path")
 load(
     "//:private/versions.bzl",
     "COURSIER_CLI_BAZEL_MIRROR_URL",
@@ -126,6 +126,20 @@ def _relativize_and_symlink_file(repository_ctx, absolute_path):
         repository_ctx.symlink(absolute_path, repository_ctx.path(artifact_relative_path))
     return artifact_relative_path
 
+# Relativize an absolute path to an artifact in maven local.
+# After relativizing, also symlink the path into the workspace's output base.
+# Then return the relative path for further processing
+def _relativize_and_symlink_file_in_maven_local(repository_ctx, absolute_path):
+    absolute_path_parts = absolute_path.split(".m2/repository")
+    if len(absolute_path_parts) != 2:
+        fail("Error while trying to parse the path of file in maven local: " + absolute_path_parts)
+    else:
+        # Make a symlink from the absolute path of the artifact to the relative
+        # path within the output_base/external.
+        artifact_relative_path = "v1" + absolute_path_parts[1]
+        repository_ctx.symlink(absolute_path, repository_ctx.path(artifact_relative_path))
+    return artifact_relative_path
+
 def _get_aar_import_statement_or_empty_str(repository_ctx):
     if repository_ctx.attr.use_starlark_android_rules:
         # parse the label to validate it
@@ -191,8 +205,10 @@ def _compute_dependency_tree_signature(artifacts):
             artifact_group.extend([
                 artifact["sha256"],
                 artifact["file"],
-                artifact["url"],
             ])
+             # The url can be None for artifacts from maven local repository
+            if artifact["url"] != None:
+                artifact_group.append(artifact["url"])
         if len(artifact["dependencies"]) > 0:
             artifact_group.append(",".join(sorted(artifact["dependencies"])))
         signature_inputs.append(":".join(artifact_group))
@@ -457,6 +473,10 @@ def _pinned_coursier_fetch_impl(repository_ctx):
                 # contains the mirror_urls field.
                 http_files.append("        urls = [\"%s\"]," % artifact["url"])
             http_files.append("    )")
+        elif is_maven_local_path(artifact["file"]):
+            # This file comes from maven local, so instead of creating an http_file for it, we simply
+            # simlink the file from the mavel local directory to file within the repository rule workspace
+            artifact.update({"file": _relativize_and_symlink_file_in_maven_local(repository_ctx, artifact["file"])})
 
     http_files.extend(_get_jq_http_files())
 
@@ -490,6 +510,7 @@ def _pinned_coursier_fetch_impl(repository_ctx):
             if a.get("testonly", False)
         },
         override_targets = repository_ctx.attr.override_targets,
+        skip_maven_local_dependencies = False,
     )
 
     repository_ctx.template(
@@ -846,6 +867,19 @@ def _coursier_fetch_impl(repository_ctx):
 
         # Normalize paths in place here.
         artifact.update({"file": _normalize_to_unix_path(artifact["file"])})
+        if is_maven_local_path(artifact["file"]):
+            # This file comes from maven local, so handle it in two different ways depending if
+            # dependency pinning is used:
+            # a) If the repository is unpinned, we keep the file as is, but clear the url to skip it
+            # b) Otherwise, we clear the url and also simlink the file from the mavel local directory
+            #    to file within the repository rule workspace
+            print("Assuming maven local for artifact: %s" % artifact["coord"])
+            artifact.update({"url": None})
+            if not repository_ctx.attr.name.startswith("unpinned_"):
+                artifact.update({"file": _relativize_and_symlink_file_in_maven_local(repository_ctx, artifact["file"])})
+
+            files_to_hash.append(repository_ctx.path(artifact["file"]))
+            continue
 
         if repository_ctx.attr.use_unsafe_shared_cache or repository_ctx.attr.name.startswith("unpinned_"):
             artifact.update({"file": _relativize_and_symlink_file(repository_ctx, artifact["file"])})
@@ -896,7 +930,11 @@ def _coursier_fetch_impl(repository_ctx):
         #
         # TODO(https://github.com/bazelbuild/rules_jvm_external/issues/186): Make this work with
         # basic auth.
-        repository_urls = [r["repo_url"].rstrip("/") for r in repositories]
+        repository_urls = []
+        for r in repositories:
+            # filter out m2Local since it's not a valid mirror url
+            if r["repo_url"] != "m2Local":
+                repository_urls.append(r["repo_url"].rstrip("/"))
         primary_artifact_path = infer_artifact_path_from_primary_and_repos(primary_url, repository_urls)
 
         mirror_urls = [url + "/" + primary_artifact_path for url in repository_urls]
@@ -954,6 +992,8 @@ def _coursier_fetch_impl(repository_ctx):
             if a.get("testonly", False)
         },
         override_targets = repository_ctx.attr.override_targets,
+        # Skip maven local dependencies if generating the unpinned repository
+        skip_maven_local_dependencies = repository_ctx.attr.name.startswith("unpinned_")
     )
 
     # This repository rule can be either in the pinned or unpinned state, depending on when
