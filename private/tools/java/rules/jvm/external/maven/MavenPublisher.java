@@ -62,7 +62,7 @@ public class MavenPublisher {
     String repo = args[0];
     if (!isSchemeSupported(repo)) {
       throw new IllegalArgumentException("Repository must be accessed via the supported schemes: "
-              + Arrays.toString(SUPPORTED_SCHEMES));
+              + Arrays.toString(SUPPORTED_SCHEMES) + " not " + repo);
     }
 
     Credentials credentials = new Credentials(args[2], args[3], Boolean.parseBoolean(args[1]));
@@ -219,8 +219,12 @@ public class MavenPublisher {
 
   private static Callable<Void> writeFile(String targetUrl, Path toUpload) {
     return () -> {
-      LOG.info(String.format("Copying %s to %s", toUpload, targetUrl));
-      Path path = Paths.get(new URL(targetUrl).toURI());
+      String url = targetUrl;
+      if (url.startsWith("file://")) {
+        url = url.substring("file://".length());
+      }
+      Path path = Paths.get(url).toAbsolutePath();
+      LOG.info(String.format("Copying %s to %s", toUpload, path));
       Files.createDirectories(path.getParent());
       Files.deleteIfExists(path);
       Files.copy(toUpload, path);
